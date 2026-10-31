@@ -22,8 +22,10 @@ jobs:
       - name: Build
         run: |
           . "$IDF_PATH/export.sh" > /dev/null
+          echo "CONFIG_MUSE_CJK_FONT=y" > devices/sdkconfig.local-cjk
           idf.py -B build -DIDF_TARGET=esp32s3 -DSDKCONFIG=build/sdkconfig \
-            -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-m5stack-stopwatch" build
+            -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-m5stack-stopwatch;devices/sdkconfig.local-cjk" build
+          grep -E "^CONFIG_MUSE_CJK_FONT" build/sdkconfig
 
       - name: Collect
         run: |
