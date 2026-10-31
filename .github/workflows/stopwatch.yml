@@ -1,0 +1,40 @@
+name: StopWatch firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.1
+    defaults:
+      run:
+        shell: bash
+        working-directory: esp32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          idf.py -B build -DIDF_TARGET=esp32s3 -DSDKCONFIG=build/sdkconfig \
+            -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-m5stack-stopwatch" build
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          cd build
+          cp flash_args flasher_args.json ../out/
+          for f in $(grep -oE '[^ ]+\.bin' flash_args); do mkdir -p "../out/$(dirname "$f")"; cp "$f" "../out/$f"; done
+          ls -lR ../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stopwatch-firmware
+          path: esp32/out/
+          retention-days: 7
