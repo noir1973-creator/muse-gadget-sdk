@@ -1043,6 +1043,7 @@ static struct {
     char *body;                  /* LTTS_RX_MAX + 1 */
     /* A request for the session task to open on Muse's connection (ltts_service). */
     bool want;
+    const char *want_verb;
     const char *want_path;
     const char *want_body;
     int64_t stream;              /* its stream there, once open */
@@ -1075,17 +1076,17 @@ static void ltts_on_frame(void *ctx, int status, const uint8_t *data, size_t len
  * reply's "result" when it says ok, with *root to cJSON_Delete afterwards;
  * null otherwise. quiet: a refusal is expected (polling), don't log it.
  */
-static cJSON *ltts_fs(ltts_route_t route, const char *path, cJSON *req, cJSON **root, bool quiet)
+static cJSON *ltts_fs(ltts_route_t route, const char *verb, const char *path, cJSON *req, cJSON **root, bool quiet)
 {
     *root = nullptr;
-    char *body = cJSON_PrintUnformatted(req);
-    if (!body) {
+    char *body = req ? cJSON_PrintUnformatted(req) : nullptr;
+    if (req && !body) {
         return nullptr;
     }
     char req_id[40];
     snprintf(req_id, sizeof(req_id), "muse-%08lx-%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
-    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web", "Content-Type", "application/json",
-                              "Accept", "application/json", nullptr };
+    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web", "Accept", "application/json",
+                              body ? "Content-Type" : nullptr, "application/json", nullptr };
     const char *via = route == LTTS_HATCH ? "Muse" : "Link";
     xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
     uint32_t gen = ++s_lrx.gen;
@@ -1096,6 +1097,7 @@ static cJSON *ltts_fs(ltts_route_t route, const char *path, cJSON *req, cJSON **
     s_lrx.stream = 0;
     if (route == LTTS_HATCH) {
         s_lrx.want = true;
+        s_lrx.want_verb = verb;
         s_lrx.want_path = path;
         s_lrx.want_body = body;
     }
@@ -1105,8 +1107,8 @@ static cJSON *ltts_fs(ltts_route_t route, const char *path, cJSON *req, cJSON **
     int64_t id = 1;
     bool sent = true;
     if (route == LTTS_LINK) {
-        id = muse_link_req_open("POST", path, headers, false, ltts_on_frame, (void *)(uintptr_t)gen);
-        size_t n = strlen(body);
+        id = muse_link_req_open(verb, path, headers, !body, ltts_on_frame, (void *)(uintptr_t)gen);
+        size_t n = body ? strlen(body) : 0;
         sent = id != 0;
         for (size_t off = 0; sent && off < n;) {
             size_t k = n - off < LTTS_SEND_PIECE ? n - off : LTTS_SEND_PIECE;
@@ -1160,7 +1162,7 @@ static bool ltts_read(ltts_route_t route, const char *file, size_t offset, uint8
     cJSON_AddNumberToObject(req, "offset", (double)offset);
     cJSON_AddNumberToObject(req, "len", (double)(cap < LTTS_PART ? cap : LTTS_PART));
     cJSON *root;
-    cJSON *result = ltts_fs(route, "/fs/read", req, &root, quiet);
+    cJSON *result = ltts_fs(route, "POST", "/fs/read", req, &root, quiet);
     cJSON_Delete(req);
     if (!result) {
         return false;
@@ -1192,7 +1194,7 @@ static bool ltts_write(ltts_route_t route, const char *file, const char *text)
     cJSON_AddBoolToObject(req, "append", false);
     cJSON_AddBoolToObject(req, "create_parent", true);
     cJSON *root;
-    cJSON *result = ltts_fs(route, "/fs/write", req, &root, false);
+    cJSON *result = ltts_fs(route, "POST", "/fs/write", req, &root, false);
     cJSON_Delete(req);
     cJSON_Delete(root);
     return result != nullptr;
@@ -1207,6 +1209,13 @@ static void ltts_probe(void)
     }
     done = true;
     uint8_t buf[33];
+    for (ltts_route_t r : { LTTS_HATCH, LTTS_LINK }) {
+        cJSON *root;
+        cJSON *result = ltts_fs(r, "GET", "/chat/history?limit=1", nullptr, &root, false);
+        ESP_LOGI(TAG, "local TTS probe: GET /chat/history?limit=1 via %s %s (HTTP %d)", r == LTTS_HATCH ? "Muse" : "Link",
+                 result ? "works" : "refused", s_lrx.status);
+        cJSON_Delete(root);
+    }
     for (ltts_route_t r : { LTTS_HATCH, LTTS_LINK }) {
         size_t got = 0;
         bool eof;
@@ -1283,7 +1292,8 @@ static void ltts_service(void)
     xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
     if (s_lrx.want) {
         s_lrx.want = false;
-        s_lrx.stream = s_connected ? open_stream(K_FS, "POST", s_lrx.want_path, "application/json", "application/json",
+        s_lrx.stream = s_connected ? open_stream(K_FS, s_lrx.want_verb, s_lrx.want_path,
+                                                 s_lrx.want_body ? "application/json" : nullptr, "application/json",
                                                  s_lrx.want_body, true)
                                    : 0;
         if (!s_lrx.stream) {
