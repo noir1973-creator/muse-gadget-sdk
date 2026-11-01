@@ -46,6 +46,8 @@ static struct {
     char host[MUSE_HOST_MAX + 1];
     char vm[MUSE_VM_MAX + 1];
     char token[MUSE_TOKEN_MAX + 1];
+    char tts_url[MUSE_TTS_URL_MAX + 1];
+    char tts_key[MUSE_TTS_KEY_MAX + 1];
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
@@ -141,6 +143,8 @@ esp_err_t muse_settings_init(void)
     load_str("host", s.host, sizeof(s.host));
     load_str("vm", s.vm, sizeof(s.vm));
     load_str("token", s.token, sizeof(s.token));
+    load_str("tts_url", s.tts_url, sizeof(s.tts_url));
+    load_str("tts_key", s.tts_key, sizeof(s.tts_key));
 
     s.volume = clampi(s.volume, 0, 100);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
@@ -206,6 +210,16 @@ size_t muse_settings_hatch_token_len(void)
     size_t n;
     LOCKED(n = strlen(s.token));
     return n;
+}
+
+void muse_settings_tts_url(char out[MUSE_TTS_URL_MAX + 1])
+{
+    LOCKED(strlcpy(out, s.tts_url, MUSE_TTS_URL_MAX + 1));
+}
+
+void muse_settings_tts_key(char out[MUSE_TTS_KEY_MAX + 1])
+{
+    LOCKED(strlcpy(out, s.tts_key, MUSE_TTS_KEY_MAX + 1));
 }
 
 void muse_settings_set_volume(int pct)
@@ -311,4 +325,20 @@ esp_err_t muse_settings_set_hatch_token(const char *token, bool append)
         notify(MUSE_SETTING_HATCH);
     }
     return err;
+}
+
+void muse_settings_set_tts_url(const char *url)
+{
+    LOCKED({
+        strlcpy(s.tts_url, url ? url : "", sizeof(s.tts_url));
+        save_str("tts_url", s.tts_url);
+    });
+}
+
+void muse_settings_set_tts_key(const char *key)
+{
+    LOCKED({
+        strlcpy(s.tts_key, key ? key : "", sizeof(s.tts_key));
+        save_str("tts_key", s.tts_key);
+    });
 }

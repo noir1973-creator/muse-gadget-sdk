@@ -361,6 +361,17 @@ if MUSE_REALTIME_VOICE
 
 endif
 
+    config MUSE_LOCAL_TTS
+        bool "Speak replies with a TTS server of your own"
+        depends on MUSE_HATCH
+        default n
+        help
+            Muse's replies are text. With this, each one is POSTed (as UTF-8,
+            with the key as X-Key) to a TTS server of your own and the MP3
+            that comes back is played, unless the speaker is off. The server
+            is set over the serial console, ">tts.url=https://..." and
+            ">tts.key=...", and kept in NVS; with no URL, replies stay text.
+
     config MUSE_HATCH_COMPACT_BUFFERS
         bool "Smaller voice session buffers, for 2 MB of PSRAM"
         depends on MUSE_HATCH
