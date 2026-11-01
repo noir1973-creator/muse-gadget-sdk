@@ -56,6 +56,7 @@
 
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -973,7 +974,13 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
 
 /*
  * With CONFIG_MUSE_LOCAL_TTS, each reply is spoken by VOICEVOX on the user's
- * VM through a file bridge there: a task writes the text to
+ * VM. Muse synthesizes it there, uploads the MP3 to its file storage and ends
+ * the reply with one "[[tts:https://muse.ai/files/...mp3]]" line per sentence
+ * (the URL ferry). start_tts() takes those lines out of the text, so captions
+ * don't show them, and a task GETs each MP3 in order into the job's buffer
+ * (ltts_fetch_urls); ltts_pump() hands it on as below.
+ *
+ * (Unused, kept for a credential with the fs scope: a file bridge there, where a task writes the text to
  * <dir>/inbox/<id>.txt with POST /fs/write on Muse's connection (the session
  * task opens the request for it: ltts_service), polls
  * <dir>/outbox/<id>.json with POST /fs/read until the bridge has made the
@@ -985,7 +992,10 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
  * The job is shared until both sides let go of it: the session can drop it
  * mid-fetch (turn over), and the task gives up at its next step.
  */
-#define LTTS_STACK 8192
+#define LTTS_STACK 12288                /* TLS for the URL ferry */
+#define LTTS_URL_PREFIX "https://muse.ai/files/"
+#define LTTS_URLS_MAX 2048              /* the message's ferry URLs, newline-separated */
+#define LTTS_HTTP_MS 15000
 #define LTTS_PART 1024                  /* /fs/read len: its escaped reply must fit a Noise frame */
 #define LTTS_SEND_PIECE 4096            /* request body pieces, under the 8 KB frame limit */
 #define LTTS_RX_MAX (8 * 1024)          /* one /fs reply */
@@ -1155,7 +1165,7 @@ static cJSON *ltts_fs(ltts_route_t route, const char *verb, const char *path, cJ
 }
 
 /* Reads part of a file on the VM: its bytes into out (cap), their count into *got. */
-static bool ltts_read(ltts_route_t route, const char *file, size_t offset, uint8_t *out, size_t cap, size_t *got, bool *eof, bool quiet)
+[[maybe_unused]] static bool ltts_read(ltts_route_t route, const char *file, size_t offset, uint8_t *out, size_t cap, size_t *got, bool *eof, bool quiet)
 {
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "path", file);
@@ -1185,7 +1195,7 @@ static bool ltts_read(ltts_route_t route, const char *file, size_t offset, uint8
     return ok;
 }
 
-static bool ltts_write(ltts_route_t route, const char *file, const char *text)
+[[maybe_unused]] static bool ltts_write(ltts_route_t route, const char *file, const char *text)
 {
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "path", file);
@@ -1201,7 +1211,7 @@ static bool ltts_write(ltts_route_t route, const char *file, const char *text)
 }
 
 /* Once per boot, for the log: which route lets this gadget read a file the bridge has (its script). */
-static void ltts_probe(void)
+[[maybe_unused]] static void ltts_probe(void)
 {
     static bool done;
     if (done) {
@@ -1225,7 +1235,7 @@ static void ltts_probe(void)
     }
 }
 
-static bool ltts_fetch_mp3(ltts_t *j)
+[[maybe_unused]] static bool ltts_fetch_mp3(ltts_t *j)
 {
     const ltts_route_t route = LTTS_HATCH;
     char id[24], file[160];
@@ -1281,6 +1291,91 @@ static bool ltts_fetch_mp3(ltts_t *j)
     ESP_LOGI(TAG, "local TTS: %u bytes of MP3 in %d ms", (unsigned)j->mp3_len,
              (int)((esp_timer_get_time() - t0) / 1000));
     return j->mp3_len > 0;
+}
+
+/* GETs each ferry URL (j->text: one per line) and appends its MP3 to j->mp3. */
+static bool ltts_fetch_urls(ltts_t *j)
+{
+    int64_t t0 = esp_timer_get_time();
+    j->mp3 = static_cast<uint8_t *>(heap_caps_malloc(MP3_BUF, MALLOC_CAP_SPIRAM));
+    if (!j->mp3) {
+        return false;
+    }
+    int n = 0;
+    for (char *url = j->text; url && *url && !j->cancel;) {
+        char *nl = strchr(url, '\n');
+        if (nl) {
+            *nl = '\0';
+        }
+        esp_http_client_config_t cfg = {};
+        cfg.url = url;
+        cfg.timeout_ms = LTTS_HTTP_MS;
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+        cfg.buffer_size = 2048;
+        cfg.max_redirection_count = 3;
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        bool ok = c && esp_http_client_open(c, 0) == ESP_OK && esp_http_client_fetch_headers(c) >= 0;
+        int status = ok ? esp_http_client_get_status_code(c) : 0;
+        if (ok && status == 200) {
+            while (!j->cancel && j->mp3_len < MP3_BUF) {
+                int got = esp_http_client_read(c, reinterpret_cast<char *>(j->mp3 + j->mp3_len), MP3_BUF - j->mp3_len);
+                if (got <= 0) {
+                    ok = got == 0;
+                    break;
+                }
+                j->mp3_len += got;
+            }
+        } else {
+            ok = false;
+        }
+        if (c) {
+            esp_http_client_cleanup(c);
+        }
+        if (!ok) {
+            ESP_LOGW(TAG, "local TTS: GET %.120s failed (HTTP %d)", url, status);
+            return false;
+        }
+        n++;
+        url = nl ? nl + 1 : nullptr;
+    }
+    ESP_LOGI(TAG, "local TTS: %d MP3(s), %u bytes in %d ms", n, (unsigned)j->mp3_len,
+             (int)((esp_timer_get_time() - t0) / 1000));
+    return !j->cancel && j->mp3_len > 0;
+}
+
+/* Takes the ferry lines ("[[tts:URL]]") out of a message's text; their URLs go to urls, one per line. */
+static void ltts_take_urls(char *text, char *urls, size_t cap)
+{
+    urls[0] = '\0';
+    size_t used = 0;
+    char *out = text;
+    for (char *p = text; *p;) {
+        char *end;
+        if (!strncmp(p, "[[tts:", 6) && (end = strstr(p + 6, "]]"))) {
+            const char *url = p + 6;
+            size_t len = end - url;
+            if (!strncmp(url, LTTS_URL_PREFIX, strlen(LTTS_URL_PREFIX)) && !memchr(url, '\n', len) &&
+                used + len + 2 <= cap) {
+                memcpy(urls + used, url, len);
+                used += len;
+                urls[used++] = '\n';
+                urls[used] = '\0';
+            }
+            p = end + 2;
+            while (*p == '\r' || *p == '\n' || *p == ' ') {
+                p++;
+            }
+            continue;
+        }
+        *out++ = *p++;
+    }
+    while (out > text && (out[-1] == '\n' || out[-1] == '\r' || out[-1] == ' ')) {
+        out--;
+    }
+    *out = '\0';
+    if (used) {
+        urls[used - 1] = '\0';
+    }
 }
 
 /* On the session task: opens a request ltts_fs() left for Muse's connection. */
@@ -1341,7 +1436,7 @@ static void ltts_task(void *arg)
     for (;;) {
         ltts_t *j;
         if (xQueueReceive(s_ltts_q, &j, portMAX_DELAY) == pdTRUE) {
-            j->state = !j->cancel && ltts_fetch_mp3(j) ? 1 : -1;
+            j->state = !j->cancel && ltts_fetch_urls(j) ? 1 : -1;
             ltts_release(j);
         }
     }
@@ -1838,7 +1933,16 @@ static void show_reply_start(const msg_t &m)
 {
     char line[EV_TEXT];
     if (s_turn.texts) {
-        if (!muse_hatch_caption_at(s_turn.texts + (&m - s_turn.msgs) * TEXT_MAX, 0, line, sizeof(line))) {
+        char *text = s_turn.texts + (&m - s_turn.msgs) * TEXT_MAX;
+        char *ferry = strstr(text, "[[");
+        if (ferry) {
+            *ferry = '\0';
+        }
+        bool any = text[0] && muse_hatch_caption_at(text, 0, line, sizeof(line));
+        if (ferry) {
+            *ferry = '[';
+        }
+        if (!any) {
             return;
         }
     } else {
@@ -1993,7 +2097,18 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        if (muse_settings_speaker_on() && ltts_enabled() && s_turn.texts && ltts_start(s_turn.texts + i * TEXT_MAX)) {
+        bool ferried = false;
+#ifdef CONFIG_MUSE_LOCAL_TTS
+        static char urls[LTTS_URLS_MAX];
+        if (s_turn.texts) {
+            ltts_take_urls(s_turn.texts + i * TEXT_MAX, urls, sizeof(urls));
+            ferried = urls[0] != '\0';
+            if (!ferried) {
+                ESP_LOGI(TAG, "local TTS: message %s has no [[tts:...]] line", m.id);
+            }
+        }
+#endif
+        if (muse_settings_speaker_on() && ltts_enabled() && ferried && ltts_start(urls)) {
             /* Spoken from a TTS of our own, as the comment below describes; ltts_pump() feeds tts_data(). */
             ESP_LOGI(TAG, "local TTS: message %s (%u bytes)", m.id, (unsigned)m.len);
             mark(M_TTS);
