@@ -362,15 +362,21 @@ if MUSE_REALTIME_VOICE
 endif
 
     config MUSE_LOCAL_TTS
-        bool "Speak replies with a TTS server of your own"
+        bool "Speak replies with VOICEVOX on the user's VM (file bridge)"
         depends on MUSE_HATCH
         default n
         help
-            Muse's replies are text. With this, each one is POSTed (as UTF-8,
-            with the key as X-Key) to a TTS server of your own and the MP3
-            that comes back is played, unless the speaker is off. The server
-            is set over the serial console, ">tts.url=https://..." and
-            ">tts.key=...", and kept in NVS; with no URL, replies stay text.
+            Muse's replies are text. With this, each one is written to
+            MUSE_LOCAL_TTS_DIR/inbox/<id>.txt on the user's VM (POST /fs/write
+            on Link's session), and once a bridge there has put <id>.mp3 and
+            <id>.json in MUSE_LOCAL_TTS_DIR/outbox, the MP3 is read back
+            (POST /fs/read) and played, unless the speaker is off. If that
+            fails the reply is shown as text, as without this.
+
+    config MUSE_LOCAL_TTS_DIR
+        string "The bridge's folder, relative to the home on the VM"
+        depends on MUSE_LOCAL_TTS
+        default "workspace/voicevox/bridge"
 
     config MUSE_HATCH_COMPACT_BUFFERS
         bool "Smaller voice session buffers, for 2 MB of PSRAM"

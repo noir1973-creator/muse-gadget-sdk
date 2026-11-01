@@ -57,7 +57,6 @@
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -65,9 +64,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
+#include "mbedtls/base64.h"
 
 extern "C" {
 #include "cJSON.h"
@@ -971,29 +972,33 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
 /* ---- Turn: local TTS ---- */
 
 /*
- * With CONFIG_MUSE_LOCAL_TTS, a task POSTs each reply's text to the TTS
- * server set over serial (tts.url, tts.key) and puts the MP3 that comes back
- * into the job's buffer; the session task moves it into s_turn.mp3
- * (ltts_pump), so decode() plays it as it would Muse's. The job is shared
- * until both sides let go of it: the session can drop it mid-fetch (turn
- * over), and the task stops at its next write. Ported from
- * chucky1102/muse-gadget-sdk's local-tts branch (see upstream issue #14).
+ * With CONFIG_MUSE_LOCAL_TTS, each reply is spoken by VOICEVOX on the user's
+ * VM through a file bridge there: a task writes the text to
+ * <dir>/inbox/<id>.txt with POST /fs/write on Link's session, polls
+ * <dir>/outbox/<id>.json with POST /fs/read until the bridge has made the
+ * MP3, then reads <dir>/outbox/<id>.mp3 in LTTS_PART pieces into the job's
+ * buffer. Once it's all in, the session task hands it to tts_data()
+ * (ltts_pump), so decode() plays it as it would Muse's. If anything fails the
+ * message falls back to the silent pacing replies normally get.
+ *
+ * The job is shared until both sides let go of it: the session can drop it
+ * mid-fetch (turn over), and the task gives up at its next step.
  */
-#define LTTS_BUF (32 * 1024)
-#define LTTS_STACK 6144
+#define LTTS_STACK 8192
+#define LTTS_PART 1024                  /* /fs/read len: its escaped reply must fit a Noise frame */
+#define LTTS_SEND_PIECE 4096            /* request body pieces, under the 8 KB frame limit */
+#define LTTS_RX_MAX (8 * 1024)          /* one /fs reply */
+#define LTTS_REQ_MS 8000                /* one /fs request */
+#define LTTS_SYNTH_MS 20000             /* the bridge making the MP3 */
+#define LTTS_POLL_MS 400
 
 struct ltts_t {
-    StreamBufferHandle_t sb;
-    StaticStreamBuffer_t *sb_struct;   /* not xStreamBufferCreateWithCaps: IDF 6.0.1's
-                                        * vStreamBufferDeleteWithCaps frees with
-                                        * vSemaphoreDelete, sometimes twice */
-    uint8_t *sb_store;
     std::atomic<int> refs{2};
     std::atomic<bool> cancel{false};
     std::atomic<int> state{0};   /* 0 fetching, 1 done, -1 failed */
     char *text;
-    char url[MUSE_TTS_URL_MAX + 1];
-    char key[MUSE_TTS_KEY_MAX + 1];
+    uint8_t *mp3;                /* PSRAM, up to MP3_BUF */
+    size_t mp3_len;
 };
 
 static ltts_t *s_ltts;
@@ -1001,9 +1006,7 @@ static ltts_t *s_ltts;
 static bool ltts_enabled(void)
 {
 #ifdef CONFIG_MUSE_LOCAL_TTS
-    char url[MUSE_TTS_URL_MAX + 1];
-    muse_settings_tts_url(url);
-    return url[0] != '\0';
+    return muse_link_req_ready();
 #else
     return false;
 #endif
@@ -1011,11 +1014,7 @@ static bool ltts_enabled(void)
 
 static void ltts_free(ltts_t *j)
 {
-    if (j->sb) {
-        vStreamBufferDelete(j->sb);
-    }
-    heap_caps_free(j->sb_struct);
-    heap_caps_free(j->sb_store);
+    heap_caps_free(j->mp3);
     free(j->text);
     delete j;
 }
@@ -1028,48 +1027,205 @@ static void ltts_release(ltts_t *j)
 }
 
 #ifdef CONFIG_MUSE_LOCAL_TTS
-static void ltts_fetch(ltts_t *j)
+/* The one /fs request in flight, filled by its callback on Link's session task. */
+static struct {
+    SemaphoreHandle_t lock;
+    SemaphoreHandle_t done;
+    uint32_t gen;                /* the callback's ctx; a stale request's frames are dropped */
+    int status;
+    bool finished;
+    bool overflow;
+    size_t len;
+    char *body;                  /* LTTS_RX_MAX + 1 */
+} s_lrx;
+
+static void ltts_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
 {
-    if (j->cancel) {   /* the turn ended while it waited its turn */
-        j->state = -1;
-        ltts_release(j);
-        return;
+    xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+    if ((uint32_t)(uintptr_t)ctx == s_lrx.gen && !s_lrx.finished) {
+        if (status) {
+            s_lrx.status = status;
+        }
+        if (len && s_lrx.len + len > LTTS_RX_MAX) {
+            s_lrx.overflow = true;
+        } else if (len) {
+            memcpy(s_lrx.body + s_lrx.len, data, len);
+            s_lrx.len += len;
+            s_lrx.body[s_lrx.len] = '\0';
+        }
+        if (end || status < 0) {
+            s_lrx.finished = true;
+            xSemaphoreGive(s_lrx.done);
+        }
     }
-    esp_http_client_config_t cfg = {};
-    cfg.url = j->url;
-    cfg.method = HTTP_METHOD_POST;
-    cfg.timeout_ms = 30000;   /* VOICEVOX on a CPU can take a while on a long reply */
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    bool ok = false;
-    if (c) {
-        esp_http_client_set_header(c, "Content-Type", "text/plain; charset=utf-8");
-        esp_http_client_set_header(c, "X-Key", j->key);
-        int len = (int)strlen(j->text);
-        int status = 0;
-        if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, j->text, len) == len &&
-            esp_http_client_fetch_headers(c) >= 0) {
-            status = esp_http_client_get_status_code(c);
-        }
-        ok = status == 200;
-        if (!ok) {
-            ESP_LOGW(TAG, "local TTS: HTTP %d", status);
-        }
-        uint8_t buf[1024];
-        while (ok && !j->cancel) {
-            int n = esp_http_client_read(c, reinterpret_cast<char *>(buf), sizeof(buf));
-            if (n <= 0) {
-                ok = n == 0;
-                break;
-            }
-            for (int off = 0; off < n && !j->cancel;) {
-                off += (int)xStreamBufferSend(j->sb, buf + off, n - off, pdMS_TO_TICKS(100));
-            }
-        }
-        esp_http_client_cleanup(c);
+    xSemaphoreGive(s_lrx.lock);
+}
+
+/*
+ * POSTs req to the VM daemon's path and waits for the reply. Returns the
+ * reply's "result" when it says ok, with *root to cJSON_Delete afterwards;
+ * null otherwise. quiet: a refusal is expected (polling), don't log it.
+ */
+static cJSON *ltts_fs(const char *path, cJSON *req, cJSON **root, bool quiet)
+{
+    *root = nullptr;
+    char *body = cJSON_PrintUnformatted(req);
+    if (!body) {
+        return nullptr;
     }
-    j->state = ok ? 1 : -1;
-    ltts_release(j);
+    char req_id[40];
+    snprintf(req_id, sizeof(req_id), "muse-%08lx-%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web", "Content-Type", "application/json",
+                              "Accept", "application/json", nullptr };
+    xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+    uint32_t gen = ++s_lrx.gen;
+    s_lrx.status = 0;
+    s_lrx.finished = s_lrx.overflow = false;
+    s_lrx.len = 0;
+    s_lrx.body[0] = '\0';
+    xSemaphoreGive(s_lrx.lock);
+    xSemaphoreTake(s_lrx.done, 0);   /* a timed-out request may have ended since */
+
+    int64_t id = muse_link_req_open("POST", path, headers, false, ltts_on_frame, (void *)(uintptr_t)gen);
+    size_t n = strlen(body);
+    bool sent = id != 0;
+    for (size_t off = 0; sent && off < n;) {
+        size_t k = n - off < LTTS_SEND_PIECE ? n - off : LTTS_SEND_PIECE;
+        sent = muse_link_req_send(id, body + off, k, off + k == n, 2000);
+        off += k;
+    }
+    cJSON_free(body);
+    if (!sent || xSemaphoreTake(s_lrx.done, pdMS_TO_TICKS(LTTS_REQ_MS)) != pdTRUE) {
+        if (id) {
+            muse_link_req_cancel(id);
+        }
+        xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+        s_lrx.gen++;
+        xSemaphoreGive(s_lrx.lock);
+        ESP_LOGW(TAG, "local TTS: %s %s", path, id ? (sent ? "timed out" : "not sent") : "Link's session is down");
+        return nullptr;
+    }
+    /* Finished: the callback is done with s_lrx. */
+    if (s_lrx.status != 200 || s_lrx.overflow) {
+        if (!quiet || s_lrx.overflow) {
+            ESP_LOGW(TAG, "local TTS: %s HTTP %d%s: %.160s", path, s_lrx.status, s_lrx.overflow ? " (reply too long)" : "",
+                     s_lrx.body);
+        }
+        return nullptr;
+    }
+    *root = cJSON_Parse(s_lrx.body);
+    cJSON *result = cJSON_GetObjectItem(*root, "result");
+    if (!cJSON_IsTrue(cJSON_GetObjectItem(*root, "ok")) || !result) {
+        if (!quiet) {
+            ESP_LOGW(TAG, "local TTS: %s refused: %.160s", path, s_lrx.body);
+        }
+        cJSON_Delete(*root);
+        *root = nullptr;
+        return nullptr;
+    }
+    return result;
+}
+
+/* Reads part of a file on the VM: its bytes into out (cap), their count into *got. */
+static bool ltts_read(const char *file, size_t offset, uint8_t *out, size_t cap, size_t *got, bool *eof, bool quiet)
+{
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "path", file);
+    cJSON_AddNumberToObject(req, "offset", (double)offset);
+    cJSON_AddNumberToObject(req, "len", (double)(cap < LTTS_PART ? cap : LTTS_PART));
+    cJSON *root;
+    cJSON *result = ltts_fs("/fs/read", req, &root, quiet);
+    cJSON_Delete(req);
+    if (!result) {
+        return false;
+    }
+    bool ok = true;
+    *got = 0;
+    *eof = cJSON_IsTrue(cJSON_GetObjectItem(result, "eof"));
+    const char *b64 = cJSON_GetStringValue(cJSON_GetObjectItem(result, "data_base64"));
+    const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(result, "text"));
+    if (b64) {
+        ok = mbedtls_base64_decode(out, cap, got, reinterpret_cast<const unsigned char *>(b64), strlen(b64)) == 0;
+    } else if (text) {
+        *got = strlen(text) < cap ? strlen(text) : cap;
+        memcpy(out, text, *got);
+    }
+    if (!*got && !*eof) {
+        ok = false;   /* nothing, and not the end: don't loop on it */
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+static bool ltts_write(const char *file, const char *text)
+{
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "path", file);
+    cJSON_AddStringToObject(req, "text", text);
+    cJSON_AddBoolToObject(req, "overwrite", true);
+    cJSON_AddBoolToObject(req, "append", false);
+    cJSON_AddBoolToObject(req, "create_parent", true);
+    cJSON *root;
+    cJSON *result = ltts_fs("/fs/write", req, &root, false);
+    cJSON_Delete(req);
+    cJSON_Delete(root);
+    return result != nullptr;
+}
+
+static bool ltts_fetch_mp3(ltts_t *j)
+{
+    char id[24], file[160];
+    snprintf(id, sizeof(id), "sw-%08lx%04lx", (unsigned long)esp_random(), (unsigned long)(esp_random() & 0xffff));
+    int64_t t0 = esp_timer_get_time();
+
+    snprintf(file, sizeof(file), CONFIG_MUSE_LOCAL_TTS_DIR "/inbox/%s.txt", id);
+    if (!ltts_write(file, j->text)) {
+        return false;
+    }
+
+    /* The bridge writes <id>.json once the MP3 is ready: {"ok": ..., "bytes": ...}. */
+    snprintf(file, sizeof(file), CONFIG_MUSE_LOCAL_TTS_DIR "/outbox/%s.json", id);
+    char meta[LTTS_PART + 1];
+    size_t got = 0;
+    bool eof;
+    for (;;) {
+        if (j->cancel) {
+            return false;
+        }
+        if (ltts_read(file, 0, reinterpret_cast<uint8_t *>(meta), LTTS_PART, &got, &eof, true) && got) {
+            break;
+        }
+        if (esp_timer_get_time() - t0 > LTTS_SYNTH_MS * 1000LL) {
+            ESP_LOGW(TAG, "local TTS: no %s after %d s", file, LTTS_SYNTH_MS / 1000);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(LTTS_POLL_MS));
+    }
+    meta[got] = '\0';
+    cJSON *m = cJSON_Parse(meta);
+    bool ok = m && !cJSON_IsFalse(cJSON_GetObjectItem(m, "ok"));
+    double bytes = cJSON_GetNumberValue(cJSON_GetObjectItem(m, "bytes"));
+    cJSON_Delete(m);
+    if (!ok) {
+        ESP_LOGW(TAG, "local TTS: the bridge failed: %.160s", meta);
+        return false;
+    }
+    size_t cap = bytes > 0 && bytes < MP3_BUF ? (size_t)bytes + LTTS_PART : MP3_BUF;
+    j->mp3 = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM));
+    if (!j->mp3) {
+        return false;
+    }
+
+    snprintf(file, sizeof(file), CONFIG_MUSE_LOCAL_TTS_DIR "/outbox/%s.mp3", id);
+    for (eof = false; !eof && j->mp3_len < cap;) {
+        if (j->cancel || !ltts_read(file, j->mp3_len, j->mp3 + j->mp3_len, cap - j->mp3_len, &got, &eof, false)) {
+            return false;
+        }
+        j->mp3_len += got;
+    }
+    ESP_LOGI(TAG, "local TTS: %u bytes of MP3 in %d ms", (unsigned)j->mp3_len,
+             (int)((esp_timer_get_time() - t0) / 1000));
+    return j->mp3_len > 0;
 }
 
 /* One task for every fetch, started with the first, rather than one per reply. */
@@ -1081,7 +1237,8 @@ static void ltts_task(void *arg)
     for (;;) {
         ltts_t *j;
         if (xQueueReceive(s_ltts_q, &j, portMAX_DELAY) == pdTRUE) {
-            ltts_fetch(j);
+            j->state = !j->cancel && ltts_fetch_mp3(j) ? 1 : -1;
+            ltts_release(j);
         }
     }
 }
@@ -1092,9 +1249,14 @@ static bool ltts_start(const char *text)
 {
 #ifdef CONFIG_MUSE_LOCAL_TTS
     if (!s_ltts_q) {
+        s_lrx.lock = xSemaphoreCreateMutex();
+        s_lrx.done = xSemaphoreCreateBinary();
+        s_lrx.body = static_cast<char *>(heap_caps_malloc(LTTS_RX_MAX + 1, MALLOC_CAP_SPIRAM));
         s_ltts_q = xQueueCreate(4, sizeof(ltts_t *));
-        if (!s_ltts_q || xTaskCreatePinnedToCoreWithCaps(ltts_task, "muse_ltts", LTTS_STACK, nullptr, 5, nullptr,
-                                                         tskNO_AFFINITY, MALLOC_CAP_SPIRAM) != pdPASS) {
+        if (!s_lrx.lock || !s_lrx.done || !s_lrx.body || !s_ltts_q ||
+            xTaskCreatePinnedToCoreWithCaps(ltts_task, "muse_ltts", LTTS_STACK, nullptr, 5, nullptr, tskNO_AFFINITY,
+                                            MALLOC_CAP_SPIRAM) != pdPASS) {
+            ESP_LOGE(TAG, "local TTS: no memory");
             if (s_ltts_q) {
                 vQueueDelete(s_ltts_q);
                 s_ltts_q = nullptr;
@@ -1106,13 +1268,10 @@ static bool ltts_start(const char *text)
     if (!j) {
         return false;
     }
-    muse_settings_tts_url(j->url);
-    muse_settings_tts_key(j->key);
-    j->sb_struct = static_cast<StaticStreamBuffer_t *>(heap_caps_calloc(1, sizeof(StaticStreamBuffer_t), MALLOC_CAP_SPIRAM));
-    j->sb_store = static_cast<uint8_t *>(heap_caps_malloc(LTTS_BUF + 1, MALLOC_CAP_SPIRAM));
-    j->sb = j->sb_struct && j->sb_store ? xStreamBufferCreateStatic(LTTS_BUF, 1, j->sb_store, j->sb_struct) : nullptr;
     j->text = strdup(text);
-    if (!j->url[0] || !j->sb || !j->text || xQueueSend(s_ltts_q, &j, 0) != pdTRUE) {
+    j->mp3 = nullptr;
+    j->mp3_len = 0;
+    if (!j->text || xQueueSend(s_ltts_q, &j, 0) != pdTRUE) {
         ltts_free(j);
         return false;
     }
@@ -1802,7 +1961,7 @@ static void tts_end(stream_t *s, bool ok)
     }
 }
 
-/* Moves what the local TTS fetched into the MP3 buffer; ends the message's stream when it's all in. */
+/* Hands the local TTS's MP3 to tts_data() once it's all in; on failure the message is paced silently. */
 static void ltts_pump(void)
 {
     ltts_t *j = s_ltts;
@@ -1813,20 +1972,21 @@ static void ltts_pump(void)
         ltts_drop();
         return;
     }
-    int state = j->state;   /* before the buffer: the task writes all its data, then sets this */
-    uint8_t buf[1024];
-    for (size_t room = MP3_BUF - s_turn.mp3_len; room;) {
-        size_t n = xStreamBufferReceive(j->sb, buf, room < sizeof(buf) ? room : sizeof(buf), 0);
-        if (!n) {
-            break;
-        }
-        tts_data(buf, n);
-        room -= n;
+    int state = j->state;
+    if (state == 0) {
+        return;
     }
-    if (state != 0 && xStreamBufferIsEmpty(j->sb)) {
-        ltts_drop();
-        s_turn.mp3_ended = true;   /* decode() plays what came, failed or not, then finishes */
+    if (state > 0) {
+        tts_data(j->mp3, j->mp3_len);
+        s_turn.mp3_ended = true;   /* decode() plays it, then finishes the message */
+    } else {
+        int i = s_turn.tts_msg;
+        size_t shown = s_turn.texts ? strlen(s_turn.texts + i * TEXT_MAX) : s_turn.msgs[i].len;
+        s_turn.msgs[i].pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+        s_turn.silent = true;
+        ESP_LOGW(TAG, "local TTS failed: showing message %s as text", s_turn.msgs[i].id);
     }
+    ltts_drop();
 }
 
 /* Speaker off: queues the shown message's silence while the reply buffer has room. */
