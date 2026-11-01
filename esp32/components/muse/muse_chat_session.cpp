@@ -993,7 +993,8 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
  * mid-fetch (turn over), and the task gives up at its next step.
  */
 #define LTTS_STACK 12288                /* TLS for the URL ferry */
-#define LTTS_URL_PREFIX "https://muse.ai/files/"
+/* Where ferry MP3s may come from: Muse's file storage, or the Drive file Muse rewrites for each reply. */
+static const char *const LTTS_URL_PREFIXES[] = { "https://muse.ai/files/", "https://drive.usercontent.google.com/download?" };
 #define LTTS_URLS_MAX 2048              /* the message's ferry URLs, newline-separated */
 #define LTTS_HTTP_MS 15000
 #define LTTS_PART 1024                  /* /fs/read len: its escaped reply must fit a Noise frame */
@@ -1354,7 +1355,11 @@ static void ltts_take_urls(char *text, char *urls, size_t cap)
         if (!strncmp(p, "[[tts:", 6) && (end = strstr(p + 6, "]]"))) {
             const char *url = p + 6;
             size_t len = end - url;
-            if (!strncmp(url, LTTS_URL_PREFIX, strlen(LTTS_URL_PREFIX)) && !memchr(url, '\n', len) &&
+            bool allowed = false;
+            for (const char *prefix : LTTS_URL_PREFIXES) {
+                allowed = allowed || !strncmp(url, prefix, strlen(prefix));
+            }
+            if (allowed && !memchr(url, '\n', len) &&
                 used + len + 2 <= cap) {
                 memcpy(urls + used, url, len);
                 used += len;
