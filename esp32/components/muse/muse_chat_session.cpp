@@ -190,7 +190,7 @@ static int64_t s_auto_backoff_us = AUTO_RETRY_MIN_US;
 
 /* ---- Streams on the connection ---- */
 
-enum kind_t : uint8_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS, K_CALL, K_END_CALL };
+enum kind_t : uint8_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS, K_CALL, K_END_CALL, K_FS };
 
 struct stream_t {
     int64_t id;
@@ -974,7 +974,8 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
 /*
  * With CONFIG_MUSE_LOCAL_TTS, each reply is spoken by VOICEVOX on the user's
  * VM through a file bridge there: a task writes the text to
- * <dir>/inbox/<id>.txt with POST /fs/write on Link's session, polls
+ * <dir>/inbox/<id>.txt with POST /fs/write on Muse's connection (the session
+ * task opens the request for it: ltts_service), polls
  * <dir>/outbox/<id>.json with POST /fs/read until the bridge has made the
  * MP3, then reads <dir>/outbox/<id>.mp3 in LTTS_PART pieces into the job's
  * buffer. Once it's all in, the session task hands it to tts_data()
@@ -1006,7 +1007,7 @@ static ltts_t *s_ltts;
 static bool ltts_enabled(void)
 {
 #ifdef CONFIG_MUSE_LOCAL_TTS
-    return muse_link_req_ready();
+    return s_connected;
 #else
     return false;
 #endif
@@ -1027,7 +1028,10 @@ static void ltts_release(ltts_t *j)
 }
 
 #ifdef CONFIG_MUSE_LOCAL_TTS
-/* The one /fs request in flight, filled by its callback on Link's session task. */
+/* Which connection a /fs request goes on: Muse's own (this file's), or Link's. */
+enum ltts_route_t { LTTS_HATCH, LTTS_LINK };
+
+/* The one /fs request in flight, filled on Muse's session task or by its callback on Link's. */
 static struct {
     SemaphoreHandle_t lock;
     SemaphoreHandle_t done;
@@ -1037,6 +1041,11 @@ static struct {
     bool overflow;
     size_t len;
     char *body;                  /* LTTS_RX_MAX + 1 */
+    /* A request for the session task to open on Muse's connection (ltts_service). */
+    bool want;
+    const char *want_path;
+    const char *want_body;
+    int64_t stream;              /* its stream there, once open */
 } s_lrx;
 
 static void ltts_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
@@ -1066,7 +1075,7 @@ static void ltts_on_frame(void *ctx, int status, const uint8_t *data, size_t len
  * reply's "result" when it says ok, with *root to cJSON_Delete afterwards;
  * null otherwise. quiet: a refusal is expected (polling), don't log it.
  */
-static cJSON *ltts_fs(const char *path, cJSON *req, cJSON **root, bool quiet)
+static cJSON *ltts_fs(ltts_route_t route, const char *path, cJSON *req, cJSON **root, bool quiet)
 {
     *root = nullptr;
     char *body = cJSON_PrintUnformatted(req);
@@ -1077,39 +1086,56 @@ static cJSON *ltts_fs(const char *path, cJSON *req, cJSON **root, bool quiet)
     snprintf(req_id, sizeof(req_id), "muse-%08lx-%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
     const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web", "Content-Type", "application/json",
                               "Accept", "application/json", nullptr };
+    const char *via = route == LTTS_HATCH ? "Muse" : "Link";
     xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
     uint32_t gen = ++s_lrx.gen;
     s_lrx.status = 0;
     s_lrx.finished = s_lrx.overflow = false;
     s_lrx.len = 0;
     s_lrx.body[0] = '\0';
+    s_lrx.stream = 0;
+    if (route == LTTS_HATCH) {
+        s_lrx.want = true;
+        s_lrx.want_path = path;
+        s_lrx.want_body = body;
+    }
     xSemaphoreGive(s_lrx.lock);
     xSemaphoreTake(s_lrx.done, 0);   /* a timed-out request may have ended since */
 
-    int64_t id = muse_link_req_open("POST", path, headers, false, ltts_on_frame, (void *)(uintptr_t)gen);
-    size_t n = strlen(body);
-    bool sent = id != 0;
-    for (size_t off = 0; sent && off < n;) {
-        size_t k = n - off < LTTS_SEND_PIECE ? n - off : LTTS_SEND_PIECE;
-        sent = muse_link_req_send(id, body + off, k, off + k == n, 2000);
-        off += k;
+    int64_t id = 1;
+    bool sent = true;
+    if (route == LTTS_LINK) {
+        id = muse_link_req_open("POST", path, headers, false, ltts_on_frame, (void *)(uintptr_t)gen);
+        size_t n = strlen(body);
+        sent = id != 0;
+        for (size_t off = 0; sent && off < n;) {
+            size_t k = n - off < LTTS_SEND_PIECE ? n - off : LTTS_SEND_PIECE;
+            sent = muse_link_req_send(id, body + off, k, off + k == n, 2000);
+            off += k;
+        }
     }
+    bool got = sent && xSemaphoreTake(s_lrx.done, pdMS_TO_TICKS(LTTS_REQ_MS)) == pdTRUE;
+    /* After this the session task no longer looks at the request (or its body). */
+    xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+    if (!got) {
+        s_lrx.gen++;
+        s_lrx.stream = 0;
+    }
+    s_lrx.want = false;
+    xSemaphoreGive(s_lrx.lock);
     cJSON_free(body);
-    if (!sent || xSemaphoreTake(s_lrx.done, pdMS_TO_TICKS(LTTS_REQ_MS)) != pdTRUE) {
-        if (id) {
+    if (!got) {
+        if (route == LTTS_LINK && id) {
             muse_link_req_cancel(id);
         }
-        xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
-        s_lrx.gen++;
-        xSemaphoreGive(s_lrx.lock);
-        ESP_LOGW(TAG, "local TTS: %s %s", path, id ? (sent ? "timed out" : "not sent") : "Link's session is down");
+        ESP_LOGW(TAG, "local TTS: %s via %s %s", path, via, id ? (sent ? "timed out" : "not sent") : "isn't up");
         return nullptr;
     }
     /* Finished: the callback is done with s_lrx. */
     if (s_lrx.status != 200 || s_lrx.overflow) {
         if (!quiet || s_lrx.overflow) {
-            ESP_LOGW(TAG, "local TTS: %s HTTP %d%s: %.160s", path, s_lrx.status, s_lrx.overflow ? " (reply too long)" : "",
-                     s_lrx.body);
+            ESP_LOGW(TAG, "local TTS: %s via %s HTTP %d%s: %.160s", path, via, s_lrx.status,
+                     s_lrx.overflow ? " (reply too long)" : "", s_lrx.body);
         }
         return nullptr;
     }
@@ -1117,7 +1143,7 @@ static cJSON *ltts_fs(const char *path, cJSON *req, cJSON **root, bool quiet)
     cJSON *result = cJSON_GetObjectItem(*root, "result");
     if (!cJSON_IsTrue(cJSON_GetObjectItem(*root, "ok")) || !result) {
         if (!quiet) {
-            ESP_LOGW(TAG, "local TTS: %s refused: %.160s", path, s_lrx.body);
+            ESP_LOGW(TAG, "local TTS: %s via %s refused: %.160s", path, via, s_lrx.body);
         }
         cJSON_Delete(*root);
         *root = nullptr;
@@ -1127,14 +1153,14 @@ static cJSON *ltts_fs(const char *path, cJSON *req, cJSON **root, bool quiet)
 }
 
 /* Reads part of a file on the VM: its bytes into out (cap), their count into *got. */
-static bool ltts_read(const char *file, size_t offset, uint8_t *out, size_t cap, size_t *got, bool *eof, bool quiet)
+static bool ltts_read(ltts_route_t route, const char *file, size_t offset, uint8_t *out, size_t cap, size_t *got, bool *eof, bool quiet)
 {
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "path", file);
     cJSON_AddNumberToObject(req, "offset", (double)offset);
     cJSON_AddNumberToObject(req, "len", (double)(cap < LTTS_PART ? cap : LTTS_PART));
     cJSON *root;
-    cJSON *result = ltts_fs("/fs/read", req, &root, quiet);
+    cJSON *result = ltts_fs(route, "/fs/read", req, &root, quiet);
     cJSON_Delete(req);
     if (!result) {
         return false;
@@ -1157,7 +1183,7 @@ static bool ltts_read(const char *file, size_t offset, uint8_t *out, size_t cap,
     return ok;
 }
 
-static bool ltts_write(const char *file, const char *text)
+static bool ltts_write(ltts_route_t route, const char *file, const char *text)
 {
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "path", file);
@@ -1166,20 +1192,40 @@ static bool ltts_write(const char *file, const char *text)
     cJSON_AddBoolToObject(req, "append", false);
     cJSON_AddBoolToObject(req, "create_parent", true);
     cJSON *root;
-    cJSON *result = ltts_fs("/fs/write", req, &root, false);
+    cJSON *result = ltts_fs(route, "/fs/write", req, &root, false);
     cJSON_Delete(req);
     cJSON_Delete(root);
     return result != nullptr;
 }
 
+/* Once per boot, for the log: which route lets this gadget read a file the bridge has (its script). */
+static void ltts_probe(void)
+{
+    static bool done;
+    if (done) {
+        return;
+    }
+    done = true;
+    uint8_t buf[33];
+    for (ltts_route_t r : { LTTS_HATCH, LTTS_LINK }) {
+        size_t got = 0;
+        bool eof;
+        bool ok = ltts_read(r, CONFIG_MUSE_LOCAL_TTS_DIR "/bridge.py", 0, buf, 32, &got, &eof, false);
+        ESP_LOGI(TAG, "local TTS probe: /fs/read via %s %s (%u bytes)", r == LTTS_HATCH ? "Muse" : "Link",
+                 ok ? "works" : "refused", (unsigned)got);
+    }
+}
+
 static bool ltts_fetch_mp3(ltts_t *j)
 {
+    const ltts_route_t route = LTTS_HATCH;
     char id[24], file[160];
+    ltts_probe();
     snprintf(id, sizeof(id), "sw-%08lx%04lx", (unsigned long)esp_random(), (unsigned long)(esp_random() & 0xffff));
     int64_t t0 = esp_timer_get_time();
 
     snprintf(file, sizeof(file), CONFIG_MUSE_LOCAL_TTS_DIR "/inbox/%s.txt", id);
-    if (!ltts_write(file, j->text)) {
+    if (!ltts_write(route, file, j->text)) {
         return false;
     }
 
@@ -1192,7 +1238,7 @@ static bool ltts_fetch_mp3(ltts_t *j)
         if (j->cancel) {
             return false;
         }
-        if (ltts_read(file, 0, reinterpret_cast<uint8_t *>(meta), LTTS_PART, &got, &eof, true) && got) {
+        if (ltts_read(route, file, 0, reinterpret_cast<uint8_t *>(meta), LTTS_PART, &got, &eof, true) && got) {
             break;
         }
         if (esp_timer_get_time() - t0 > LTTS_SYNTH_MS * 1000LL) {
@@ -1218,7 +1264,7 @@ static bool ltts_fetch_mp3(ltts_t *j)
 
     snprintf(file, sizeof(file), CONFIG_MUSE_LOCAL_TTS_DIR "/outbox/%s.mp3", id);
     for (eof = false; !eof && j->mp3_len < cap;) {
-        if (j->cancel || !ltts_read(file, j->mp3_len, j->mp3 + j->mp3_len, cap - j->mp3_len, &got, &eof, false)) {
+        if (j->cancel || !ltts_read(route, file, j->mp3_len, j->mp3 + j->mp3_len, cap - j->mp3_len, &got, &eof, false)) {
             return false;
         }
         j->mp3_len += got;
@@ -1226,6 +1272,54 @@ static bool ltts_fetch_mp3(ltts_t *j)
     ESP_LOGI(TAG, "local TTS: %u bytes of MP3 in %d ms", (unsigned)j->mp3_len,
              (int)((esp_timer_get_time() - t0) / 1000));
     return j->mp3_len > 0;
+}
+
+/* On the session task: opens a request ltts_fs() left for Muse's connection. */
+static void ltts_service(void)
+{
+    if (!s_lrx.lock) {
+        return;
+    }
+    xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+    if (s_lrx.want) {
+        s_lrx.want = false;
+        s_lrx.stream = s_connected ? open_stream(K_FS, "POST", s_lrx.want_path, "application/json", "application/json",
+                                                 s_lrx.want_body, true)
+                                   : 0;
+        if (!s_lrx.stream) {
+            s_lrx.status = -1;
+            s_lrx.finished = true;
+            xSemaphoreGive(s_lrx.done);
+        }
+    }
+    xSemaphoreGive(s_lrx.lock);
+}
+
+/* On the session task: a K_FS stream's reply. */
+static void ltts_stream_data(int64_t id, const uint8_t *data, size_t len)
+{
+    xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+    if (id == s_lrx.stream && !s_lrx.finished && len) {
+        if (s_lrx.len + len > LTTS_RX_MAX) {
+            s_lrx.overflow = true;
+        } else {
+            memcpy(s_lrx.body + s_lrx.len, data, len);
+            s_lrx.len += len;
+            s_lrx.body[s_lrx.len] = '\0';
+        }
+    }
+    xSemaphoreGive(s_lrx.lock);
+}
+
+static void ltts_stream_end(int64_t id, int status, bool ok)
+{
+    xSemaphoreTake(s_lrx.lock, portMAX_DELAY);
+    if (id == s_lrx.stream && !s_lrx.finished) {
+        s_lrx.status = ok ? (status ? status : 200) : (status >= 400 ? status : -1);
+        s_lrx.finished = true;
+        xSemaphoreGive(s_lrx.done);
+    }
+    xSemaphoreGive(s_lrx.lock);
 }
 
 /* One task for every fetch, started with the first, rather than one per reply. */
@@ -2188,6 +2282,11 @@ static void stream_data(stream_t *s, ConstByteSpan data)
             tts_data(data.data(), data.size());
         }
         break;
+#ifdef CONFIG_MUSE_LOCAL_TTS
+    case K_FS:
+        ltts_stream_data(s->id, data.data(), data.size());
+        break;
+#endif
 #if CONFIG_MUSE_REALTIME_VOICE
     case K_CALL:
     case K_END_CALL:
@@ -2223,6 +2322,15 @@ static bool stream_end(stream_t *s, bool ok)
     case K_TTS:
         tts_end(s, ok);
         break;
+#ifdef CONFIG_MUSE_LOCAL_TTS
+    case K_FS: {
+        int64_t id = s->id;
+        int status = s->status;
+        close_stream(s);
+        ltts_stream_end(id, status, ok);
+        break;
+    }
+#endif
 #if CONFIG_MUSE_REALTIME_VOICE
     case K_CALL:
     case K_END_CALL: {
@@ -2480,6 +2588,9 @@ static void hatch_task(void *arg)
             ltts_pump();
             decode();
         }
+#ifdef CONFIG_MUSE_LOCAL_TTS
+        ltts_service();
+#endif
         if (!s_connected) {
             continue;
         }
