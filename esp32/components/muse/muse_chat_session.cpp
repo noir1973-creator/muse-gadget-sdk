@@ -77,6 +77,7 @@ extern "C" {
 #include "muse_account_api.h"
 #include "muse_link.h"
 #include "muse_settings.h"
+#include "muse_voice.h"
 #include "muse_wifi.h"
 }
 #include "muse_chat_priv.h"
@@ -1397,6 +1398,34 @@ static bool ltts_fetch_urls(ltts_t *j)
     return !j->cancel && j->mp3_len > 0;
 }
 
+/* Takes "[[alarm:HH:MM]]" / "[[alarm:off]]" lines out of a message's text and sets the alarm from the last. */
+static void take_alarm(char *text)
+{
+    char spec[16] = "";
+    char *out = text;
+    for (char *p = text; *p;) {
+        char *end;
+        if (!strncmp(p, "[[alarm:", 8) && (end = strstr(p + 8, "]]")) && end - (p + 8) < (int)sizeof(spec)) {
+            memcpy(spec, p + 8, end - (p + 8));
+            spec[end - (p + 8)] = '\0';
+            p = end + 2;
+            while (*p == '\r' || *p == '\n' || *p == ' ') {
+                p++;
+            }
+            continue;
+        }
+        *out++ = *p++;
+    }
+    while (out > text && (out[-1] == '\n' || out[-1] == '\r' || out[-1] == ' ')) {
+        out--;
+    }
+    *out = '\0';
+    if (spec[0] && strcmp(spec, "now") != 0) {
+        bool ok = muse_voice_set_alarm(spec);
+        ESP_LOGI(TAG, "reply set the alarm: %s%s", spec, ok ? "" : " (not HH:MM or off)");
+    }
+}
+
 /* Takes the ferry lines ("[[tts:URL]]") out of a message's text; their URLs go to urls, one per line. */
 static void ltts_take_urls(char *text, char *urls, size_t cap)
 {
@@ -2154,6 +2183,9 @@ static void start_tts(void)
         msg_t &m = s_turn.msgs[i];
         if (m.tts != TTS_QUEUED) {
             continue;
+        }
+        if (s_turn.texts) {
+            take_alarm(s_turn.texts + i * TEXT_MAX);
         }
         bool ferried = false;
 #ifdef CONFIG_MUSE_LOCAL_TTS

@@ -1287,7 +1287,8 @@ static void voice_task(void *arg)
  * is up (Japan time), a task checks it every ALARM_POLL_MS, and when the set
  * minute comes the voice task beeps at full volume until any button (or
  * ALARM_RING_S). The time (minutes after midnight, -1 off) is kept in NVS;
- * the console sets it: >alarm=HH:MM, >alarm=off, >alarm=now (rings at once).
+ * the console sets it: >alarm=HH:MM, >alarm=off, >alarm=now (rings at once),
+ * and so does a reply ending in [[alarm:HH:MM]] or [[alarm:off]] (asked for by voice).
  */
 #define ALARM_TZ "JST-9"
 #define ALARM_NTP "pool.ntp.org"
@@ -1298,6 +1299,8 @@ static void voice_task(void *arg)
 #define ALARM_AMP 26000.0f
 
 static volatile int s_alarm_min = ALARM_DEFAULT_MIN;
+static volatile bool s_alarm_dirty;   /* s_alarm_min changed: the alarm task saves it */
+static TaskHandle_t s_alarm_task;
 static void alarm_load(void)
 {
     nvs_handle_t h;
@@ -1332,11 +1335,9 @@ bool muse_voice_set_alarm(const char *spec)
         return false;
     }
     s_alarm_min = min;
-    nvs_handle_t nh;
-    if (nvs_open("muse_alarm", NVS_READWRITE, &nh) == ESP_OK) {
-        nvs_set_i16(nh, "min", (int16_t)min);
-        nvs_commit(nh);
-        nvs_close(nh);
+    s_alarm_dirty = true;
+    if (s_alarm_task) {
+        xTaskNotifyGive(s_alarm_task);
     }
     if (min < 0) {
         ESP_LOGI(TAG, "alarm: off");
@@ -1354,6 +1355,15 @@ static void alarm_task(void *arg)
     bool sntp = false, logged = false;
     int last = -1;   /* the day and minute it last rang */
     for (;;) {
+        if (s_alarm_dirty) {
+            s_alarm_dirty = false;
+            nvs_handle_t nh;
+            if (nvs_open("muse_alarm", NVS_READWRITE, &nh) == ESP_OK) {
+                nvs_set_i16(nh, "min", (int16_t)s_alarm_min);
+                nvs_commit(nh);
+                nvs_close(nh);
+            }
+        }
         if (!sntp && muse_wifi_connected()) {
             esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
             esp_sntp_setservername(0, ALARM_NTP);
@@ -1378,7 +1388,7 @@ static void alarm_task(void *arg)
                 alarm_ring_now();
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(ALARM_POLL_MS));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ALARM_POLL_MS));
     }
 }
 
@@ -1456,8 +1466,8 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         return ESP_ERR_NO_MEM;
     }
     alarm_load();
-    if (xTaskCreatePinnedToCoreWithCaps(alarm_task, "muse_alarm", 4096, NULL, 2, NULL, tskNO_AFFINITY,
-                                        MUSE_BIG_CAPS) != pdPASS) {
+    /* Internal RAM stack: this task writes the alarm to NVS. */
+    if (xTaskCreatePinnedToCore(alarm_task, "muse_alarm", 4096, NULL, 2, &s_alarm_task, tskNO_AFFINITY) != pdPASS) {
         ESP_LOGW(TAG, "alarm: no memory for its task");
     }
     return ESP_OK;
