@@ -83,6 +83,8 @@ static volatile bool s_monitor;
 static volatile float s_monitor_db = -100.0f;
 static volatile bool s_chirp;
 static volatile bool s_loopback;
+static volatile bool s_alarm_ring;   /* the alarm is due: ring_alarm() on the voice task */
+static void ring_alarm(void);
 static volatile bool s_mp3test;
 static atomic_int s_call_view;
 static atomic_bool s_ptt_call;
@@ -1296,8 +1298,6 @@ static void voice_task(void *arg)
 #define ALARM_AMP 26000.0f
 
 static volatile int s_alarm_min = ALARM_DEFAULT_MIN;
-static volatile bool s_alarm_ring;
-
 static void alarm_load(void)
 {
     nvs_handle_t h;
