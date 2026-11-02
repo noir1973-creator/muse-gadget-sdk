@@ -21,12 +21,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 #include "muse_adpcm.h"
@@ -1144,7 +1148,7 @@ static void voice_task(void *arg)
             muse_input_event_t ev;
             bool asleep = muse_state_asleep();
             bool battery = muse_state_on_battery();
-            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;
+            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback && !s_alarm_ring;
 #if HOLD_NOTES
             /* A press goes first: send_held() leaves it queued and returns
              * without backing off, so retrying before it's read would spin. */
@@ -1190,6 +1194,12 @@ static void voice_task(void *arg)
                 s_loopback = false;
                 muse_audio_loopback_test(muse_settings_volume());
                 pre_reset();
+            }
+            if (s_alarm_ring) {
+                s_alarm_ring = false;
+                ring_alarm();
+                pre_reset();
+                continue;
             }
             /* The 20 ms read paces this loop. */
             idle_capture();
@@ -1268,6 +1278,164 @@ static void voice_task(void *arg)
     }
 }
 
+/* ---- Alarm ---- */
+
+/*
+ * A daily alarm that doesn't need Muse: the clock comes from SNTP once Wi-Fi
+ * is up (Japan time), a task checks it every ALARM_POLL_MS, and when the set
+ * minute comes the voice task beeps at full volume until any button (or
+ * ALARM_RING_S). The time (minutes after midnight, -1 off) is kept in NVS;
+ * the console sets it: >alarm=HH:MM, >alarm=off, >alarm=now (rings at once).
+ */
+#define ALARM_TZ "JST-9"
+#define ALARM_NTP "pool.ntp.org"
+#define ALARM_DEFAULT_MIN (7 * 60)
+#define ALARM_POLL_MS 20000
+#define ALARM_RING_S 120
+#define ALARM_TONE_HZ 2000.0f
+#define ALARM_AMP 26000.0f
+
+static volatile int s_alarm_min = ALARM_DEFAULT_MIN;
+static volatile bool s_alarm_ring;
+
+static void alarm_load(void)
+{
+    nvs_handle_t h;
+    int16_t v;
+    if (nvs_open("muse_alarm", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_i16(h, "min", &v) == ESP_OK && v >= -1 && v < 24 * 60) {
+            s_alarm_min = v;
+        }
+        nvs_close(h);
+    }
+}
+
+static void alarm_ring_now(void)
+{
+    s_alarm_ring = true;
+    muse_state_set_asleep(false);   /* the screen on, and the resting voice task back */
+    muse_state_nudge();
+}
+
+bool muse_voice_set_alarm(const char *spec)
+{
+    int h, m, min;
+    if (!strcmp(spec, "now")) {
+        alarm_ring_now();
+        return true;
+    }
+    if (!strcmp(spec, "off")) {
+        min = -1;
+    } else if (sscanf(spec, "%d:%d", &h, &m) == 2 && h >= 0 && h < 24 && m >= 0 && m < 60) {
+        min = h * 60 + m;
+    } else {
+        return false;
+    }
+    s_alarm_min = min;
+    nvs_handle_t nh;
+    if (nvs_open("muse_alarm", NVS_READWRITE, &nh) == ESP_OK) {
+        nvs_set_i16(nh, "min", (int16_t)min);
+        nvs_commit(nh);
+        nvs_close(nh);
+    }
+    if (min < 0) {
+        ESP_LOGI(TAG, "alarm: off");
+    } else {
+        ESP_LOGI(TAG, "alarm: %02d:%02d daily", min / 60, min % 60);
+    }
+    return true;
+}
+
+static void alarm_task(void *arg)
+{
+    (void)arg;
+    setenv("TZ", ALARM_TZ, 1);
+    tzset();
+    bool sntp = false, logged = false;
+    int last = -1;   /* the day and minute it last rang */
+    for (;;) {
+        if (!sntp && muse_wifi_connected()) {
+            esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, ALARM_NTP);
+            esp_sntp_init();
+            sntp = true;
+        }
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        int min = s_alarm_min;
+        if (now > 1704067200) {   /* set: after 2024-01-01 */
+            if (!logged) {
+                logged = true;
+                ESP_LOGI(TAG, "alarm: clock %04d-%02d-%02d %02d:%02d, alarm %s%02d:%02d", tm.tm_year + 1900,
+                         tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, min < 0 ? "off " : "",
+                         min < 0 ? 0 : min / 60, min < 0 ? 0 : min % 60);
+            }
+            int key = tm.tm_yday * 24 * 60 + min;
+            if (min >= 0 && tm.tm_hour * 60 + tm.tm_min == min && key != last) {
+                last = key;
+                ESP_LOGI(TAG, "alarm: %02d:%02d", min / 60, min % 60);
+                alarm_ring_now();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(ALARM_POLL_MS));
+    }
+}
+
+/* On the voice task: beeps (four short, a pause) until a button, sleep or ALARM_RING_S. */
+static void ring_alarm(void)
+{
+    int min = s_alarm_min;
+    if (min >= 0) {
+        muse_state_set_caption("ALARM %02d:%02d", min / 60, min % 60);
+    } else {
+        muse_state_set_caption("ALARM");
+    }
+    muse_state_poke();
+    muse_audio_set_volume(100);
+    static int16_t chunk[MUSE_AUDIO_CHUNK];
+    const int chunk_ms = MUSE_AUDIO_CHUNK * 1000 / MUSE_AUDIO_RATE;
+    float phase = 0;
+    const float step = 2.0f * (float)M_PI * ALARM_TONE_HZ / MUSE_AUDIO_RATE;
+    int64_t t0 = esp_timer_get_time();
+    const char *why = "timeout";
+    for (int ms = 0;; ms += chunk_ms) {
+        float elapsed = (float)(esp_timer_get_time() - t0) / 1e6f;
+        if (elapsed > ALARM_RING_S) {
+            break;
+        }
+        muse_input_event_t ev;
+        if (xQueueReceive(s_queue, &ev, 0) == pdTRUE) {
+            muse_input_clear_call_pending(ev.mark);
+            why = "talk key";
+            break;
+        }
+        if (elapsed > 1.0f && muse_state_idle_secs() < elapsed - 0.5f) {
+            why = "button";
+            break;
+        }
+        if (elapsed > 1.0f && muse_state_asleep()) {
+            why = "sleep";
+            break;
+        }
+        int at = ms % 1400;   /* 4 x (100 ms on, 100 ms off), then 600 ms quiet */
+        bool on = at < 800 && at % 200 < 100;
+        for (int i = 0; i < MUSE_AUDIO_CHUNK; i++) {
+            chunk[i] = on ? (int16_t)(ALARM_AMP * sinf(phase)) : 0;
+            phase += step;
+            if (phase > 2.0f * (float)M_PI) {
+                phase -= 2.0f * (float)M_PI;
+            }
+        }
+        muse_audio_write(chunk, MUSE_AUDIO_CHUNK);
+    }
+    memset(chunk, 0, sizeof(chunk));
+    muse_audio_write(chunk, MUSE_AUDIO_CHUNK);
+    muse_audio_set_volume(muse_settings_volume());
+    ESP_LOGI(TAG, "alarm: stopped (%s)", why);
+    go_idle("");
+}
+
 esp_err_t muse_voice_start(QueueHandle_t queue)
 {
     s_queue = queue;
@@ -1286,6 +1454,11 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         muse_state_set_mode(MUSE_MODE_ERROR);
         muse_state_set_caption("AUDIO INIT FAILED");
         return ESP_ERR_NO_MEM;
+    }
+    alarm_load();
+    if (xTaskCreatePinnedToCoreWithCaps(alarm_task, "muse_alarm", 4096, NULL, 2, NULL, tskNO_AFFINITY,
+                                        MUSE_BIG_CAPS) != pdPASS) {
+        ESP_LOGW(TAG, "alarm: no memory for its task");
     }
     return ESP_OK;
 }

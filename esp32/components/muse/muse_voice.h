@@ -65,6 +65,9 @@ void muse_voice_request_chirp(void);
 /* Runs muse_audio_loopback_test() at the current volume (when idle); results go to the log. */
 void muse_voice_request_loopback(void);
 
+/* The daily alarm: "HH:MM", "off", or "now" to ring at once. False if spec is none of those. */
+bool muse_voice_set_alarm(const char *spec);
+
 /* Bench test: decodes and plays a built-in MP3 reply. */
 void muse_voice_request_mp3test(void);
 
